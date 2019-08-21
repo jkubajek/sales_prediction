@@ -1,0 +1,432 @@
+---
+title: "Predykcja sprzedaży"
+output: html_notebook
+---
+
+# Wstęp
+Celem poniższej analizy jest eksploracja danych sprzedażowych oraz predykcja tygodniowej sprzedaży poszczególnych sklepów, a tym samym całej sieci.
+
+# Analiza wstępna
+## Wczytanie danych
+
+```{r}
+# ###################################################################
+# Libraries
+# ###################################################################
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(readr)
+library(ggplot2)
+library(lubridate)
+
+options(stringsAsFactors = F)
+# ###################################################################
+# Working directory
+# ###################################################################
+work_dir <- "D:/Osobiste/analizy/sales_prediction/"
+
+# ###################################################################
+# Reading files
+# ###################################################################
+train_data <- read.csv(paste0(work_dir, "data/train.csv")) %>%
+    dummies::dummy.data.frame(names = c("StateHoliday"), sep = "_", all = T) %>%
+    mutate(SundayOpen = ifelse(DayOfWeek == 7 & Open == 1, 1, 0))
+stores_data <- read.csv(paste0(work_dir, "data/store.csv"))
+
+```
+
+## Podstawowe statystyki
+Dostarczone zbiory zawierają dane dla 1115 sklepów z 942 różnych dni. Na podstawie zamieszczonego wykresu można zauważyć, że wartość dziennej sprzedaży nie ma rozkładu normalnego.
+```{r}
+# ###################################################################
+# Statistics
+# ###################################################################
+stores_num <- train_data %>%
+    distinct(Store) %>%
+    nrow()
+print(stores_num)
+
+days_num <- train_data %>%
+    distinct(Date) %>%
+    nrow()
+print(days_num)
+
+# ###################################################################
+# Plot data
+# ###################################################################
+ggplot(subset(train_data, Sales > 0))+
+    geom_point(aes(x = Customers, y = Sales))+
+    labs(title = "Wielkość sprzedaży w zależności od liczby klientów")+
+    theme_bw()
+
+ggplot(subset(train_data, Sales > 0))+
+    geom_density(aes(x =  Sales, y = ..density..))+
+    labs(title = "Rozkład wartości sprzedaży dziennej")+
+    theme_bw()
+```
+
+```{r}
+
+# ###################################################################
+# Sales per day
+# ###################################################################
+week_stats <- train_data %>%
+    mutate(Sales_pc = Sales / Customers, 
+           DayOfWeek = DayOfWeek %>% as.character())
+
+ggplot(week_stats, aes(y=Sales_pc, x = DayOfWeek, group=DayOfWeek))+
+    labs(title = "Sprzedaż na klienta w poszczególnych dniach")+
+    geom_boxplot()+
+    facet_wrap(~year)+
+    theme_bw()
+
+```
+
+Analizując powyższy wykres można zauważyć, że wartość sprzedaży przypadająca na jednego klienta jest stała od poniedziałku do soboty. Natomiast średnia wartość paragonu w niedzielę jest wyraźnie niższa. Może mieć to różne przyczy. Po pierwsze nie wszystkie sklepy są otwarte w niedzielę, tak więc może okazać się że otwarte są jedynie mniejsze sklep. Z drugiej strony, jest możliwe że w niedzielę do sklepów przychodzą osoby, które *czegoś zapomniały* w tygodniu.
+
+# Grupowanie 
+W dalszej części analizy, na podstawie cech charakterystycznych sklepów tj. odległości od konkurencji, uczestnictwa w promocjach kuponowych (Promo2) oraz dziennej wielkość sprzedaży i średniej wartości paragonu, wyodrębniono jednorodne grupy sklepów.
+
+Wyniki algorytmu **silhouette** wskazują na to, że wśród badnych sklepów można wyszczególnić pięć grup. Pierwsza z nich, to sklepy o dużej odległości od konkurencji. Kolejna charakteryzuje się relatywnie niewielką odległością od konkurencji, ale nie prowadzi promocji kuponowych. Trzecia grupa to natomiast sklepy o najmniejszej odległości od konurencji, prowadzące promocje kuponowe i jednocześnie najniższej średniej wartości paragonu. Na czwartą grupę składają się sklepy o największej wartości sprzedaży na klienta, ich konkurencja znajduje się w większej odległości i większość z nich bierze udział w promocjach kuponowych. Do ostatniej grupy należą sklepy o wysokiej wartości dziennego obrotu, mające blisko siebie konkurencję i niebiorące udziału w regularnych promocjach.
+
+```{r}
+# ###################################################################
+# Clustering
+# ###################################################################
+stores_stats <- train_data %>%
+    mutate(Sales_pc = Sales / Customers) %>%
+    filter(Sales > 0) %>%
+    filter(! is.na(Sales_pc)) %>%
+    group_by(Store) %>%
+    summarise(Sales_pc = mean(Sales_pc),
+              Sales = mean(Sales))
+
+cluster_data <- stores_data %>%
+    dplyr::select(Store, 
+                  CompetitionDistance,
+                  Promo2) %>%
+    left_join(stores_stats, by = "Store") %>%
+    na.omit() %>%
+    dplyr::select(-Store)
+
+cluster_data_scaled <- cluster_data %>%
+    scale() %>%
+    as.data.frame()
+data <- cluster_data_scaled
+
+set.seed(4)
+factoextra::fviz_nbclust(data, kmeans, method = "silhouette")
+# Optymalne jest 5 clustrow
+
+
+# Srednie wartosci dla poszczegolnych grup
+set.seed(4)
+stores_cluster <- kmeans(cluster_data_scaled, 5)
+cluster_data$cluster <- stores_cluster$cluster
+cluster_stats <- cluster_data %>%
+    group_by(cluster) %>%
+    summarise_all(mean) %>%
+    left_join(cluster_data %>%
+                  group_by(cluster) %>%
+                  summarise(counts = n()), by = "cluster")
+cluster_stats
+```
+
+# Predykcja
+Na potrzeby tego zadania, w predykcji nie zostaną wykorzystane wyodrębnione grupy. W prawdziwej analizie należałoby przetestować czy lepszych wyników nie daje zbudowanie oddzielnych modeli dla każdej z wyodrębnionej grupy.
+
+Zadaniem przedstawionych modeli predykcyjnych (regresja liniowa i XGBoost) jest przewidywanie sprzedaży poszczególnych sklepów w kolejnym tygodniu kalendarzowym, liczonym od poniedziałku do niedzieli. W obu modelach zastosowano przekształcenie znane w ekonometrii panelowej jako *Fixed Effects (FE)*. Modele FE zakładają że w przypadku każdej jednostki mamy do czynienia ze stałym dla niej efektem, który wpływa na objaśnianą zmienną, w tym wypadku na logarytm wartośći sprzedaży. Aby wyestymować model FE za pomocą zykłej regresji liniowej, bez dodania zmiennych biarnych dla każdej jednostki, wystarczy od każdej zmiennej objaśniającej oraz od objaśnianej odjąć średnią wartość danej cechy dla danej jednostki (sklepu). 
+
+W obu modelach uwzględniono te same predyktory: opóźnienie zmiennej objaśnianej, informacja o otwarciu w niedzielę, odsetek dni z promocjami specjalnymi (Promo), informacja o obowiązywaniu promocji kuponowej (Promo2), liczba dni w które sklep był otwarty (Open) oraz zmienne mówiące o świętach państwowych i wakacjach. Ze względu na przekształcenie FE, nie uwzględniono cech stałych w czasie (asortyment i typ sklepu).
+
+## Przekształcenie zbioru
+
+```{r}
+# ###################################################################
+# Przeksztalcenie zbioru do predykcji
+# ###################################################################
+dominant <- function(x){
+    tab <- table(x)
+    y <- which.max(tab)
+    return(names(y))
+}
+
+scale_function <- function(x) x - mean(x, na.rm = T)
+
+# Dodanie informacji o Promo2
+promo_2_data <- stores_data %>%
+    filter(Promo2 == 1) %>%
+    mutate(Promo2SinceWeek = Promo2SinceWeek + (Promo2SinceYear-2013)*52) %>%
+    dplyr::select(Store, PromoInterval, Promo2SinceWeek) %>%
+    tidyr::separate(PromoInterval, into=c("month_1", "month_2", "month_3", "month_4")) %>%
+    gather(key = "key", value = "promo2_month", -Store, -Promo2SinceWeek) %>%
+    mutate(promo2_month = ifelse(promo2_month=="Sept", "Sep", promo2_month),
+           promo2_month = readr::parse_date(paste0("02-", promo2_month, "-2015"), format = "%d-%b-%Y", locale = locale("en")) %>% 
+                          format("%m") %>% as.numeric()) %>%
+    dplyr::select(-key) %>%
+    mutate(Promo2 = 1) %>%
+    rename(month = promo2_month)
+
+# Agregacja i modyfikacja zbioru
+train_data_weeks <- train_data %>%
+    separate(Date, into = c("year", "month", "day"), sep = "-", remove = F) %>%
+    mutate(week_num = as.Date(Date, "%Y-%m-%d") %>% format("%V"), # Tutaj poczatek tygodnia jest w poniedzialek
+           date = as.Date(Date, "%Y-%m-%d")) %>%
+    mutate(year = year %>% as.numeric(),
+           week_num = week_num %>% as.numeric(),
+           year = ifelse((week_num == 1) & (month == 12), year + 1, year),
+           month = ifelse((week_num == 1) & (month == 12), 1, month) %>% as.numeric()) %>%
+    filter(! ((week_num == 1) & (year == 2013))) %>%
+    filter(! ((week_num == 31) & (year == 2015))) %>%
+    mutate(week_num = week_num + 52*(year-2013)) %>%
+    # Dodanie informacji o Promo2
+    left_join(promo_2_data, by = c("Store", "month")) %>%
+    mutate(Promo2 = ifelse(is.na(Promo2), 0,
+                           ifelse(week_num < Promo2SinceWeek, 0, Promo2))) %>%
+    dplyr::select(-Promo2SinceWeek) %>%
+    # Agregacja
+    group_by(Store, week_num) %>%
+    summarise(Sales = sum(Sales), date = min(date), SundayOpen = sum(SundayOpen),
+              Promo = mean(Promo), Open = sum(Open), StateHoliday_0 = sum(StateHoliday_0), 
+              StateHoliday_a = sum(StateHoliday_a), StateHoliday_b = sum(StateHoliday_b), 
+              StateHoliday_c = sum(StateHoliday_c), SchoolHoliday = mean(SchoolHoliday),
+              month = dominant(month), year = dominant(year), Promo2 = mean(Promo2)) %>%
+    group_by(Store) %>%
+    mutate(Sales_log = log(Sales)) %>%
+    arrange(date) %>%
+    filter(! is.na(Sales_log) & Sales > 0) %>%
+    mutate(Sales_log_lag = dplyr::lag(Sales_log)) %>%
+    ungroup() %>%
+    data.frame() %>%
+    dummies::dummy.data.frame(names = c("month"), sep = "_", all = T) %>%
+    group_by(Store)
+```
+
+## Przeciętna sprzedaż tygodniowa
+Poniższy wykres przedstawia przeciętną sprzedaż tygodniową. Obserwacje podzielono na dwie grupy. W pierwszej znalazły się sklepy, które przez mniej niż 4 dni w tygodniu prowadziły promocje (Promo).
+```{r}
+weekly_stats <- train_data_weeks %>%
+    filter((Sales > 0)) %>%
+    mutate(Promo = ifelse(Promo > 0.5, "Promocja", "Brak promocji")) %>%
+    group_by(week_num, Promo) %>%
+    summarise(Sales = mean(Sales), date = min(date))
+
+ggplot(weekly_stats, aes(x = date, y = Sales))+
+    labs(title = "Przeciętna sprzedaż tygodniowa")+
+    geom_point()+
+    geom_line(alpha=.2)+
+    facet_grid(~Promo)+
+    theme_bw()
+```
+
+## Podział na zbiór treningowy i testowy
+Ze względu na to że dane są szeregiem czasowym, nie można losowo dobrać zbioru uczącego i testowego. Przyjęto, że w pierwszym znajdą się obserwacje ze 110 pierwszych tygodni, pozostałe zaś trafiły do zbioru testowego.
+
+```{r}
+test_data_weeks <- train_data_weeks %>%
+    filter(week_num > 110)
+
+train_data_weeks <- train_data_weeks %>%
+    filter(week_num <= 110)
+```
+
+## Transformacja FE
+
+```{r}
+mean_na_rm <- function(x) mean(x, na.rm = T)
+stores_means <- train_data_weeks %>%
+    dplyr::select(Store, Sales_log, Sales_log_lag, SundayOpen, Promo, Promo2,
+                  Open, starts_with("State"), SchoolHoliday, matches("month")) %>%
+    group_by(Store) %>%
+    summarise_all(mean_na_rm)
+
+col_names <- colnames(stores_means)
+col_names <- paste0(col_names, "_mean")
+colnames(stores_means) <- col_names
+
+test_data_weeks <- test_data_weeks %>%
+    left_join(stores_means, by = c("Store" = "Store_mean")) %>%
+    mutate(Sales_log = Sales_log - Sales_log_mean,
+           Sales_log_lag = Sales_log_lag - Sales_log_lag_mean, 
+           SundayOpen = SundayOpen - SundayOpen_mean,
+           Promo_real = Promo,
+           Promo = Promo - Promo_mean, 
+           Promo2 = Promo2 - Promo2_mean, 
+           Open = Open - Open_mean, 
+           StateHoliday_0 = StateHoliday_0 - StateHoliday_0_mean, 
+           StateHoliday_a = StateHoliday_a - StateHoliday_a_mean,
+           StateHoliday_b = StateHoliday_b - StateHoliday_b_mean,
+           StateHoliday_c = StateHoliday_c - StateHoliday_c_mean,
+           SchoolHoliday = SchoolHoliday - SchoolHoliday_mean)
+
+train_data_weeks <- train_data_weeks %>%
+    group_by(Store) %>%
+    mutate_at(vars(Sales_log, Sales_log_lag, SundayOpen, Promo, Promo2, Open, matches("Holiday"), matches("month")), scale_function)
+
+
+```
+
+## Regresja liniowa
+Interpretując wyniki regresji liniowej należy pamiętać o tym, że uzyskane parametry mogą być obciążone ze względu na uwzględnienie w modelu opóźnienia zmiennej objaśnianej. Aby uzyskać nieobciążone oszacowania, należałoby wyestymować panel dynamiczny. Niestety obcenie dostępne pakiety w R nie pozwalają na efektywną estymację modeli dynamicznych dla dużych zbiorów danych.
+
+Niemniej, można zauważyć że zgodnie z przewidywaniami promocje specjalne zwiększają wartość sprzedaży i to aż o 50\%. Z kolei promocje kuponowe nieznacznie zmniejszają tygodniowy poziom sprzedaży (-0,3\%).
+
+```{r}
+model_FE <- lm(Sales_log ~ Sales_log_lag + SundayOpen + Promo + Promo2 + StateHoliday_a + StateHoliday_b +
+                   StateHoliday_c + SchoolHoliday,
+               data = train_data_weeks)
+model_FE %>% summary()
+
+# Predykcja
+test_data_weeks$prediction_fe <- predict(model_FE, test_data_weeks)
+
+test_data_weeks <- test_data_weeks %>%
+    mutate(prediction_fe = exp(prediction_fe + Sales_log_mean),
+           res_fe = Sales - prediction_fe)
+```
+
+## XGBoost
+### Hiperparametryzacja
+Na podstawie optymalizacji hiperparametrów najlepsze okazały się następujące parametry: eta - 0,25, max_depth - 7 oraz gamma równa zero.
+
+```{r}
+# ###################################################################
+# XGBoost
+# ###################################################################
+library(caret)
+# Tuning
+tune_grid <- expand.grid(
+    nrounds = 200,
+    eta = c(0.1, 0.25, 0.5, 0.75),
+    max_depth = c(3, 5, 7),
+    gamma = c(0, 5, 10),
+    colsample_bytree = 1,
+    min_child_weight = 1,
+    subsample = 1
+)
+
+tune_control <- caret::trainControl(
+    method = "cv", # cross-validation
+    number = 3, 
+    verboseIter = FALSE, 
+    allowParallel = TRUE 
+)
+input_x <- as.matrix(select(ungroup(train_data_weeks), 
+                            Sales_log_lag, SundayOpen, Promo, Promo2, Open, matches("Holiday")))
+input_y <- train_data_weeks$Sales_log
+
+xgb_tune <- caret::train(
+    x = input_x,
+    y = input_y,
+    trControl = tune_control,
+    tuneGrid = tune_grid,
+    method = "xgbTree",
+    verbose = TRUE
+)
+```
+
+```{r}
+plot(xgb_tune)
+```
+
+
+### Estymacja modelu
+
+```{r}
+# Estimation
+library(xgboost)
+train_data_xgb <- train_data_weeks %>% 
+    dplyr::select(-matches("month")) %>%
+    filter(week_num <= 95) %>%
+    ungroup() %>%
+    dplyr::select(Sales_log, Sales_log_lag, SundayOpen, Promo, Promo2, Open, matches("Holiday"))
+
+tuning_data_xgb <- train_data_weeks %>% 
+    dplyr::select(-matches("month")) %>%
+    filter(week_num > 95) %>%
+    ungroup() %>%
+    dplyr::select(Sales_log, Sales_log_lag, SundayOpen, Promo, Promo2, Open, matches("Holiday"))
+
+test_data_xgb <- test_data_weeks %>%
+    dplyr::select(-matches("month")) %>%
+    ungroup() %>%
+    dplyr::select(Sales_log, Sales_log_lag, SundayOpen, Promo, Promo2, Open, matches("Holiday"))
+
+# Sparse Matrix - training
+samp_matrix <- as.matrix(train_data_xgb[-which(colnames(train_data_xgb) == "Sales_log")])
+X_spm <- as(samp_matrix, "dgCMatrix")
+xgb_matrix_train <- xgb.DMatrix(label = train_data_xgb[["Sales_log"]], data = X_spm)
+rm(samp_matrix, X_spm)
+gc(reset = T)
+
+samp_matrix <- as.matrix(tuning_data_xgb[-which(colnames(tuning_data_xgb) == "Sales_log")])
+X_spm <- as(samp_matrix, "dgCMatrix")
+xgb_matrix_tuning <- xgb.DMatrix(label = tuning_data_xgb[["Sales_log"]], data = X_spm)
+rm(samp_matrix, X_spm)
+gc(reset = T)
+
+samp_matrix <- as.matrix(test_data_xgb[-which(colnames(test_data_xgb) == "Sales_log")])
+X_spm <- as(samp_matrix, "dgCMatrix")
+xgb_matrix_test <- xgb.DMatrix(label = test_data_xgb[["Sales_log"]], data = X_spm)
+rm(samp_matrix, X_spm)
+gc(reset = T)
+
+
+# XGBoost
+set.seed(1001)
+test_watchlist <- list(test = xgb_matrix_tuning)
+model_xgb <- xgb.train(data = xgb_matrix_train, 
+                       objective = "reg:linear",
+                       nrounds = 350,
+                       watchlist = test_watchlist,
+                       early_stopping_rounds = 10,
+                       alpha = 0.8,
+                       lambda = 0.8,
+                       eta = 0.25,
+                       gamma = 0,
+                       max_depth = 7,
+                       nthread = 4)
+
+test_data_weeks$prediction_xgb <- predict(model_xgb, newdata = xgb_matrix_test)
+
+test_data_weeks <- test_data_weeks %>%
+    mutate(prediction_xgb = exp(prediction_xgb + Sales_log_mean),
+           res_xgb = Sales - prediction_xgb)
+```
+
+
+## Jakość predykcji
+Korzystając z pierwiastka średniego błędu kwadratowego (**RMSE**) jako wyznacznika jakości modelu, lepszy okazał się model stworzony za pomocą algorytmu **XGBoost**. Widać to również na wykresie prezentującym zestawienie przeciętnych predykcji z faktyczną średnią sprzedażą tygodniową, gdzie kropki odpowiadające modelowi XGBoost są wyraźnie bliżej prawdziwych wartości.
+
+```{r}
+# RMSE
+test_data_weeks %>%
+    ungroup() %>%
+    summarise(xgb = sqrt(mean(res_xgb^2)),
+              fe = sqrt(mean(res_fe^2)))
+
+# Wykres dla predykcji
+test_weekly_stats <- test_data_weeks %>%
+    ungroup() %>%
+    mutate(Promo = ifelse(Promo_real > 0.5, "Promocja", "Brak promocji")) %>%
+    group_by(week_num, Promo) %>%
+    summarise(Sales = mean(Sales), prediction_fe = mean(prediction_fe, na.rm = T),
+              prediction_xgb = mean(prediction_xgb, na.rm = T),
+              date = min(date))
+
+ggplot(test_weekly_stats, aes(x = date, y = Sales))+
+    geom_point(aes(color = "1"))+
+    geom_point(aes(x = date, y = prediction_fe, color = "2"))+
+    geom_point(aes(x = date, y = prediction_xgb, color = "3"))+
+    geom_line(alpha = .2)+
+    geom_line(aes(x = date, y = prediction_fe), color = "red3", alpha = .2)+
+    geom_line(aes(x = date, y = prediction_xgb), color = "#56B4E9", alpha = .2)+
+    facet_wrap(~Promo)+
+    scale_color_manual(values = c("black", "red3", "#56B4E9"),
+                       labels = c("Rzeczywistość", "Regresja", "XGBoost"),
+                       name = "Legenda")+
+    theme_bw()
+
+```
+
